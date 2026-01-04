@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -550,6 +552,45 @@ func TestRun(t *testing.T) {
 	time.Sleep(time.Second * 1)
 	assert.False(t, checkPortHaveBeenUsed(port))
 	t.Logf("stopped")
+}
+
+func TestBuildRunSkipsBuildWhenPending(t *testing.T) {
+	e, err := NewEngine("", nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outFile := filepath.Join(t.TempDir(), "build_ran.txt")
+	e.config.Build.Cmd = fmt.Sprintf("echo BUILD_RAN > %s", outFile)
+
+	e.buildPending.Store(true)
+	e.buildRun(context.Background())
+
+	if _, err := os.Stat(outFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected build cmd to be skipped, got err: %v", err)
+	}
+}
+
+func TestRunCommandCopyOutputContextCancel(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh syntax")
+	}
+
+	e, err := NewEngine("", nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err = e.runCommandCopyOutputContext(ctx, "sleep 2; echo done")
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
 }
 
 func checkPortConnectionRefused(port int) bool {
@@ -1166,125 +1207,4 @@ func TestEngineExit(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestBuildRunRaceCondition tests that a new build does not receive
-// stop signals meant for a previous build. This is a regression test for issue #784.
-//
-// The fix uses a channel-of-channels pattern where each build gets its own unique
-// stop channel. When a new build is triggered, it retrieves the previous build's
-// stop channel and closes it to signal cancellation.
-func TestBuildRunRaceCondition(t *testing.T) {
-	e, err := NewEngine("", nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	e.config.Log.Silent = true
-
-	// Simulate the race condition scenario from issue #784:
-	// 1. Build A starts and puts its stop channel in buildRunCh
-	// 2. Build B is triggered, retrieves Build A's channel and closes it
-	// 3. Build B puts its own fresh channel in buildRunCh
-	// 4. Build B should NOT be affected by Build A's closed channel
-
-	// Simulate Build A putting its stop channel in buildRunCh
-	buildAStopCh := make(chan struct{})
-	e.buildRunCh <- buildAStopCh
-
-	// Simulate Build B being triggered (mimics what start() does)
-	var retrievedChannel chan struct{}
-	select {
-	case retrievedChannel = <-e.buildRunCh:
-		close(retrievedChannel) // Signal Build A to stop
-	default:
-		t.Fatal("Expected Build A's stop channel to be in buildRunCh")
-	}
-
-	// Verify we got Build A's channel
-	if retrievedChannel != buildAStopCh {
-		t.Error("Should have retrieved Build A's stop channel")
-	}
-
-	// Verify Build A's channel is closed
-	select {
-	case <-buildAStopCh:
-		// Good - Build A was signaled to stop
-	default:
-		t.Error("Build A's stop channel should have been closed")
-	}
-
-	// Now simulate Build B starting with its own channel
-	buildBStopCh := make(chan struct{})
-	e.buildRunCh <- buildBStopCh
-
-	// Build B should NOT be affected by Build A's closed channel
-	select {
-	case <-buildBStopCh:
-		t.Error("Build B's stop channel should NOT be closed yet")
-	case <-time.After(50 * time.Millisecond):
-		// Good - Build B is still running
-	}
-
-	// Test that closing Build B's channel does signal Build B to stop
-	close(buildBStopCh)
-	select {
-	case <-buildBStopCh:
-		// Good - Build B received the stop signal
-	case <-time.After(50 * time.Millisecond):
-		t.Error("Build B should have been stopped when its channel was closed")
-	}
-
-	// Clean up - remove Build B's channel from buildRunCh
-	select {
-	case <-e.buildRunCh:
-		// Successfully cleaned up
-	default:
-		t.Error("Expected Build B's channel to still be in buildRunCh")
-	}
-}
-
-// TestBuildRunRaceConditionRapidChanges tests rapid file changes don't cause deadlock
-func TestBuildRunRaceConditionRapidChanges(t *testing.T) {
-	e, err := NewEngine("", nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	e.config.Log.Silent = true
-
-	// Simulate 5 rapid builds in succession
-	channels := make([]chan struct{}, 5)
-
-	for i := 0; i < 5; i++ {
-		// If there's a previous build, stop it
-		select {
-		case oldCh := <-e.buildRunCh:
-			close(oldCh)
-		default:
-		}
-
-		// Start new build
-		channels[i] = make(chan struct{})
-		e.buildRunCh <- channels[i]
-	}
-
-	// All previous builds should be signaled to stop
-	for i := 0; i < 4; i++ {
-		select {
-		case <-channels[i]:
-			// Good - was signaled to stop
-		default:
-			t.Errorf("Build %d should have been signaled to stop", i)
-		}
-	}
-
-	// Last build should NOT be stopped
-	select {
-	case <-channels[4]:
-		t.Error("Last build should still be running")
-	default:
-		// Good
-	}
-
-	// Clean up
-	<-e.buildRunCh
 }

@@ -1,6 +1,9 @@
 package runner
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -29,14 +32,8 @@ type Engine struct {
 
 	eventCh       chan string
 	watcherStopCh chan bool
-	// buildRunCh serves dual purpose:
-	// 1. As a semaphore ensuring only one build runs at a time (buffer size 1)
-	// 2. Carries each build's unique stop channel for cancellation
-	// When a new build starts, it retrieves the previous build's stop channel,
-	// closes it to signal cancellation, then inserts its own fresh channel.
-	// This prevents the race condition where a new build could consume a stop
-	// signal meant for a previous build (issue #784).
-	buildRunCh chan chan struct{}
+	buildReqCh    chan struct{}
+	buildPending  atomic.Bool
 	// binStopCh is a channel for process termination control
 	// Type chan<- chan int indicates it's a send-only channel that transmits another channel(chan int)
 	binStopCh chan<- chan int
@@ -75,7 +72,7 @@ func NewEngineWithConfig(cfg *Config, debugMode bool) (*Engine, error) {
 		runArgs:       runArgs,
 		eventCh:       make(chan string, 1000),
 		watcherStopCh: make(chan bool, 10),
-		buildRunCh:    make(chan chan struct{}, 1),
+		buildReqCh:    make(chan struct{}, 1),
 		exitCh:        make(chan bool),
 		fileChecksums: &checksumMap{m: make(map[string]string)},
 		watchers:      0,
@@ -369,6 +366,7 @@ func (e *Engine) start() {
 	}
 
 	e.running.Store(true)
+	go e.buildLoop()
 	firstRunCh := make(chan bool, 1)
 	firstRunCh <- true
 
@@ -410,42 +408,69 @@ func (e *Engine) start() {
 			// go down
 		}
 
-		// Stop any currently running build by closing its stop channel
-		select {
-		case oldStopCh := <-e.buildRunCh:
-			// Close the old build's stop channel to signal it to stop
-			close(oldStopCh)
-		default:
-			// No build is currently running
-		}
-
-		// if current app is running, stop it
-		e.stopBin()
-
-		go e.buildRun()
+		e.requestBuild()
 	}
 }
 
-func (e *Engine) buildRun() {
-	// Create this build's unique stop channel
-	myStopCh := make(chan struct{})
-
-	// Put our stop channel in buildRunCh (acts as semaphore + carries our stop token)
-	e.buildRunCh <- myStopCh
-	defer func() {
-		<-e.buildRunCh
-	}()
-
-	// Check if we were already signaled to stop before we even started
+func (e *Engine) requestBuild() {
+	e.buildPending.Store(true)
 	select {
-	case <-myStopCh:
-		return
-	case <-e.exitCh:
-		e.mainDebug("exit in buildRun before pre_cmd")
-		return
+	case e.buildReqCh <- struct{}{}:
 	default:
 	}
+}
 
+func (e *Engine) buildLoop() {
+	for {
+		if !e.buildPending.Load() {
+			select {
+			case <-e.exitCh:
+				return
+			case <-e.buildReqCh:
+			}
+		} else {
+			select {
+			case <-e.exitCh:
+				return
+			default:
+			}
+		}
+
+		// Coalesce bursts of events into a single build.
+		for {
+			select {
+			case <-e.buildReqCh:
+			default:
+				goto startBuild
+			}
+		}
+
+	startBuild:
+		e.buildPending.Store(false)
+		e.stopBin()
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-e.buildReqCh:
+				e.buildPending.Store(true)
+				cancel()
+			case <-e.exitCh:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		e.buildRun(ctx)
+		cancel()
+
+		// If a new build request came in while we were building, loop immediately.
+		if e.buildPending.Load() {
+			continue
+		}
+	}
+}
+
+func (e *Engine) buildRun(ctx context.Context) {
 	var err error
 	if err = e.runPreCmd(); err != nil {
 		e.runnerLog("failed to execute pre_cmd: %s", err.Error())
@@ -453,7 +478,13 @@ func (e *Engine) buildRun() {
 			return
 		}
 	}
-	if output, err := e.building(); err != nil {
+	if e.buildPending.Load() || ctx.Err() != nil {
+		return
+	}
+	if output, err := e.building(ctx); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		e.buildLog("failed to build, error: %s", err.Error())
 		_ = e.writeBuildErrorLog(err.Error())
 		if e.config.Build.StopOnError {
@@ -471,12 +502,12 @@ func (e *Engine) buildRun() {
 		}
 	}
 
-	// Check again before running the binary
-	select {
-	case <-myStopCh:
+	if e.buildPending.Load() || ctx.Err() != nil {
 		return
+	}
+	select {
 	case <-e.exitCh:
-		e.mainDebug("exit in buildRun after build")
+		e.mainDebug("exit in buildRun")
 		return
 	default:
 	}
@@ -537,10 +568,52 @@ func (e *Engine) runCommandCopyOutput(command string) (string, error) {
 	return string(stdoutBytes), nil
 }
 
+func (e *Engine) runCommandCopyOutputContext(ctx context.Context, command string) (string, error) {
+	cmd, stdout, stderr, err := e.startCmdWithContext(ctx, command)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		stdout.Close()
+		stderr.Close()
+	}()
+
+	var buf bytes.Buffer
+	stdoutWriter := io.MultiWriter(os.Stdout, &buf)
+	stderrWriter := io.MultiWriter(os.Stderr, &buf)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(stdoutWriter, stdout)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(stderrWriter, stderr)
+	}()
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	select {
+	case <-ctx.Done():
+		_, _ = e.killCmd(cmd)
+		<-waitCh
+		wg.Wait()
+		return buf.String(), ctx.Err()
+	case err = <-waitCh:
+		wg.Wait()
+		return buf.String(), err
+	}
+}
+
 // run cmd option in .air.toml
-func (e *Engine) building() (string, error) {
+func (e *Engine) building(ctx context.Context) (string, error) {
 	e.buildLog("building...")
-	output, err := e.runCommandCopyOutput(e.config.Build.Cmd)
+	output, err := e.runCommandCopyOutputContext(ctx, e.config.Build.Cmd)
 	if err != nil {
 		return output, err
 	}
